@@ -1,0 +1,12 @@
+{
+  "domain": "mitsubishi_heavy",
+  "name": "Mitsubishi Heavy IR Climate",
+  "codeowners": ["@ofedotov"],
+  "config_flow": true,
+  "dependencies": ["remote"],
+  "documentation": "https://github.com/ofedotov/ha-mitsubishi-heavy",
+  "integration_type": "device",
+  "iot_class": "assumed_state",
+  "issue_tracker": "https://github.com/ofedotov/ha-mitsubishi-heavy/issues",
+  "version": "1.0.0"
+}

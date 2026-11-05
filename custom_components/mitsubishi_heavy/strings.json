@@ -1,0 +1,68 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Mitsubishi Heavy IR Climate",
+        "description": "Select the Mitsubishi Heavy infrared protocol used by your indoor unit.",
+        "data": {
+          "protocol": "IR Protocol",
+          "remote_entity": "Remote Entity"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Mitsubishi Heavy IR Options",
+        "data": {
+          "protocol": "IR Protocol",
+          "remote_entity": "Remote Entity"
+        }
+      }
+    }
+  },
+  "entity": {
+    "climate": {
+      "mitsubishi_heavy": {
+        "state_attributes": {
+          "fan_mode": {
+            "state": {
+              "ultralow": "Ultra Low"
+            }
+          },
+          "preset_mode": {
+            "state": {
+              "quiet": "Silent"
+            }
+          },
+          "swing_mode": {
+            "state": {
+              "auto": "Auto Swing",
+              "highest": "Highest",
+              "high": "High",
+              "middle": "Middle",
+              "low": "Low",
+              "lowest": "Lowest",
+              "off": "Stopped"
+            }
+          },
+          "swing_horizontal_mode": {
+            "state": {
+              "off": "Stopped",
+              "auto": "Auto Swing",
+              "3d_auto": "3D Auto",
+              "left_max": "Far Left",
+              "left": "Left",
+              "middle": "Center",
+              "right": "Right",
+              "right_max": "Far Right",
+              "left_right": "Wide (Left & Right)",
+              "right_left": "Spot (Center Focus)"
+            }
+          }
+        }
+      }
+    }
+  }
+}
