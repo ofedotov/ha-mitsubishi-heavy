@@ -86,6 +86,7 @@ PROTOCOL_CAPABILITIES: dict[str, ProtocolCapabilities] = {
             SWING_V_HIGH,
             SWING_V_MIDDLE,
             SWING_V_LOW,
+            SWING_V_LOWEST,
             SWING_V_OFF,
         ),
         swing_h_modes=(
@@ -177,6 +178,7 @@ _MHI88_SWING_V_CODE: dict[str, int] = {
     SWING_V_AUTO: 4,     # 0b100
     SWING_V_LOW: 5,      # 0b101
     SWING_V_HIGHEST: 6,  # 0b110
+    SWING_V_LOWEST: 7,   # 0b111
 }
 
 _MHI88_SWING_H_CODE: dict[str, int] = {

@@ -40,8 +40,12 @@ from .protocol import (
     MODE_FAN_ONLY,
     MODE_HEAT,
     MODE_HEAT_COOL,
+    PRESET_BOOST,
+    PRESET_ECO,
     PRESET_NONE,
     PROTOCOL_CAPABILITIES,
+    SWING_H_3D_AUTO,
+    SWING_V_AUTO,
     ACState,
     encode_broadlink_command,
     encode_frame_bytes,
@@ -137,7 +141,10 @@ class MitsubishiHeavyClimate(ClimateEntity, RestoreEntity):
     _attr_assumed_state = True
     _attr_should_poll = False
     _attr_translation_key = "mitsubishi_heavy"
-    _attr_temperature_unit = UnitOfTemperature.CELSIUS
+    if hasattr(ClimateEntity, "native_temperature_unit"):
+        _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
+    else:
+        _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_min_temp = float(MIN_TEMP)
     _attr_max_temp = float(MAX_TEMP)
     _attr_target_temperature_step = TEMP_STEP
@@ -363,8 +370,11 @@ class MitsubishiHeavyClimate(ClimateEntity, RestoreEntity):
             raise HomeAssistantError(f"Unsupported fan mode: {fan_mode}")
         self._attr_fan_mode = fan_mode
         # Selecting a manual fan speed clears fan-override presets (Boost / Eco)
-        if self._attr_preset_mode in ("boost", "eco"):
+        if self._attr_preset_mode in (PRESET_BOOST, PRESET_ECO):
             self._attr_preset_mode = PRESET_NONE
+        # On physical MHI remotes, manual fan speed cancels 3D Auto (which otherwise overrides air volume)
+        if fan_mode != FAN_AUTO and self._attr_swing_horizontal_mode == SWING_H_3D_AUTO:
+            self._attr_swing_horizontal_mode = self._caps.default_swing_h
         if self._attr_hvac_mode != HVACMode.OFF:
             await self._async_transmit_state()
         self.async_write_ha_state()
@@ -374,6 +384,9 @@ class MitsubishiHeavyClimate(ClimateEntity, RestoreEntity):
         if swing_mode not in self._caps.swing_v_modes:
             raise HomeAssistantError(f"Unsupported vertical swing mode: {swing_mode}")
         self._attr_swing_mode = swing_mode
+        # Manual vertical louver position cancels 3D Auto on physical MHI remotes
+        if swing_mode != SWING_V_AUTO and self._attr_swing_horizontal_mode == SWING_H_3D_AUTO:
+            self._attr_swing_horizontal_mode = self._caps.default_swing_h
         if self._attr_hvac_mode != HVACMode.OFF:
             await self._async_transmit_state()
         self.async_write_ha_state()
@@ -394,6 +407,12 @@ class MitsubishiHeavyClimate(ClimateEntity, RestoreEntity):
         if preset_mode not in self._caps.preset_modes:
             raise HomeAssistantError(f"Unsupported preset mode: {preset_mode}")
         self._attr_preset_mode = preset_mode
+        # Boost (HI POWER) and Eco cancel 3D Auto on physical MHI remotes
+        if (
+            preset_mode in (PRESET_BOOST, PRESET_ECO)
+            and self._attr_swing_horizontal_mode == SWING_H_3D_AUTO
+        ):
+            self._attr_swing_horizontal_mode = self._caps.default_swing_h
         if self._attr_hvac_mode != HVACMode.OFF:
             await self._async_transmit_state()
         self.async_write_ha_state()

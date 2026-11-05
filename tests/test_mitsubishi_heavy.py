@@ -88,6 +88,10 @@ def _install_ha_stubs() -> None:
         hass = None
 
         @property
+        def native_temperature_unit(self):
+            return getattr(self, "_attr_native_temperature_unit", None)
+
+        @property
         def hvac_mode(self):
             return getattr(self, "_attr_hvac_mode", None)
 
@@ -306,6 +310,10 @@ class TestMitsubishiHeavyComponent(unittest.TestCase):
         for k in range(3):
             self.assertEqual(f_3d[5 + 2 * k] ^ f_3d[6 + 2 * k], 0xFF)
 
+        # SwingV Lowest (7 = 0b111 -> SwingV5=1 -> B5=0x02, SwingV7=3 -> B7|=0x18) + Fan High (4 -> B7|=0x80) -> B7=0x98
+        st_lowest = ACState(power=True, mode="heat", temperature=23, fan="high", swing_v="lowest", swing_h="off")
+        self.assertEqual(encode_frame_bytes(PROTOCOL_MHI_88, st_lowest).hex(" "), "ad 51 3c d9 26 02 fd 98 67 6c 93")
+
         # Off clears bit 3 of B9
         st_off = ACState(power=False, mode="heat", temperature=23, fan="auto", swing_v="auto", swing_h="off")
         self.assertEqual(encode_frame_bytes(PROTOCOL_MHI_88, st_off)[9], 0x64)
@@ -403,6 +411,31 @@ class TestMitsubishiHeavyComponent(unittest.TestCase):
         asyncio.run(entity.async_set_fan_mode("high"))
         self.assertEqual(entity.preset_mode, "none")
         self.assertEqual(entity.extra_state_attributes["last_ir_frame_hex"], "ad 51 3c d9 26 00 ff 90 6f 8c 73")
+
+        # Enabling 3D Auto sets B5=0xC8; Fan Auto keeps 3D Auto, whereas manual fan / Boost / manual SwingV cancels 3D Auto
+        asyncio.run(entity.async_set_swing_horizontal_mode("3d_auto"))
+        self.assertEqual(entity.swing_horizontal_mode, "3d_auto")
+        self.assertEqual(entity.extra_state_attributes["last_ir_frame_hex"], "ad 51 3c d9 26 c8 37 90 6f 8c 73")
+
+        asyncio.run(entity.async_set_fan_mode("auto"))
+        self.assertEqual(entity.swing_horizontal_mode, "3d_auto")
+
+        asyncio.run(entity.async_set_fan_mode("high"))
+        self.assertEqual(entity.swing_horizontal_mode, "off")
+        self.assertEqual(entity.extra_state_attributes["last_ir_frame_hex"], "ad 51 3c d9 26 00 ff 90 6f 8c 73")
+
+        asyncio.run(entity.async_set_swing_horizontal_mode("3d_auto"))
+        asyncio.run(entity.async_set_swing_mode("lowest"))
+        self.assertEqual(entity.swing_horizontal_mode, "off")
+        self.assertEqual(entity.extra_state_attributes["last_ir_frame_hex"], "ad 51 3c d9 26 02 fd 98 67 8c 73")
+
+        asyncio.run(entity.async_set_swing_mode("auto"))
+        asyncio.run(entity.async_set_swing_horizontal_mode("3d_auto"))
+        asyncio.run(entity.async_set_preset_mode("boost"))
+        self.assertEqual(entity.swing_horizontal_mode, "off")
+        self.assertEqual(entity.extra_state_attributes["last_ir_frame_hex"], "ad 51 3c d9 26 00 ff d0 2f 8c 73")
+
+        asyncio.run(entity.async_set_fan_mode("high"))
 
         # Turn OFF clears power bit and remembers last active mode (HEAT) for next Turn ON
         asyncio.run(entity.async_turn_off())
