@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 import voluptuous as vol
@@ -22,6 +24,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import (
+    COALESCE_DELAY_SECONDS,
     CONF_PROTOCOL,
     CONF_REMOTE_ENTITY,
     DEFAULT_NAME,
@@ -29,6 +32,7 @@ from .const import (
     DOMAIN,
     MAX_TEMP,
     MIN_TEMP,
+    MIN_TX_GAP_SECONDS,
     PROTOCOLS,
     TEMP_STEP,
 )
@@ -58,6 +62,9 @@ if TYPE_CHECKING:
     from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 _LOGGER = logging.getLogger(__name__)
+
+_HAS_NATIVE_TEMP_UNIT = hasattr(ClimateEntity, "native_temperature_unit")
+_HAS_NATIVE_TARGET_TEMP = hasattr(ClimateEntity, "native_target_temperature")
 
 _HVAC_TO_PROTO_MODE: dict[HVACMode, str] = {
     HVACMode.HEAT_COOL: MODE_HEAT_COOL,
@@ -141,7 +148,7 @@ class MitsubishiHeavyClimate(ClimateEntity, RestoreEntity):
     _attr_assumed_state = True
     _attr_should_poll = False
     _attr_translation_key = "mitsubishi_heavy"
-    if hasattr(ClimateEntity, "native_temperature_unit"):
+    if _HAS_NATIVE_TEMP_UNIT:
         _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
     else:
         _attr_temperature_unit = UnitOfTemperature.CELSIUS
@@ -165,11 +172,19 @@ class MitsubishiHeavyClimate(ClimateEntity, RestoreEntity):
         name: str | None,
         unique_id: str | None,
         device_info: DeviceInfo | None,
+        *,
+        coalesce_delay: float = COALESCE_DELAY_SECONDS,
+        min_tx_gap: float = MIN_TX_GAP_SECONDS,
     ) -> None:
         """Initialize the Mitsubishi Heavy IR Climate entity."""
         self._protocol = protocol
         self._configured_remote_entity = remote_entity
         self._caps = PROTOCOL_CAPABILITIES[protocol]
+        self._coalesce_delay = coalesce_delay
+        self._min_tx_gap = min_tx_gap
+        self._tx_lock = asyncio.Lock()
+        self._debounce_task: asyncio.Task[None] | None = None
+        self._last_tx_monotonic: float = 0.0
 
         if device_info is not None:
             self._attr_has_entity_name = True
@@ -206,7 +221,8 @@ class MitsubishiHeavyClimate(ClimateEntity, RestoreEntity):
         # Current state
         self._attr_hvac_mode: HVACMode = HVACMode.OFF
         self._last_active_hvac_mode: HVACMode = HVACMode.COOL
-        self._attr_target_temperature: float = float(DEFAULT_TEMP)
+        self._target_temp: float = float(DEFAULT_TEMP)
+        self._set_target_temp(float(DEFAULT_TEMP))
         self._attr_fan_mode: str = FAN_AUTO
         self._attr_swing_mode: str | None = (
             self._caps.default_swing_v if self._caps.swing_v_modes else None
@@ -218,6 +234,14 @@ class MitsubishiHeavyClimate(ClimateEntity, RestoreEntity):
             PRESET_NONE if self._caps.preset_modes else None
         )
         self._last_frame_hex: str | None = None
+
+    def _set_target_temp(self, value: float) -> None:
+        """Update target temperature using HA 2026.11+ native attribute when available."""
+        self._target_temp = value
+        if _HAS_NATIVE_TARGET_TEMP:
+            self._attr_native_target_temperature = value
+        else:
+            self._attr_target_temperature = value
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -252,8 +276,8 @@ class MitsubishiHeavyClimate(ClimateEntity, RestoreEntity):
         temp = attrs.get(ATTR_TEMPERATURE)
         if temp is not None:
             try:
-                self._attr_target_temperature = float(
-                    max(MIN_TEMP, min(MAX_TEMP, round(float(temp))))
+                self._set_target_temp(
+                    float(max(MIN_TEMP, min(MAX_TEMP, round(float(temp)))))
                 )
             except (TypeError, ValueError):
                 pass
@@ -277,6 +301,13 @@ class MitsubishiHeavyClimate(ClimateEntity, RestoreEntity):
         if attrs.get(_ATTR_LAST_FRAME_HEX):
             self._last_frame_hex = attrs[_ATTR_LAST_FRAME_HEX]
 
+    async def async_will_remove_from_hass(self) -> None:
+        """Cancel any pending debounced transmission task upon entity removal."""
+        if self._debounce_task is not None and not self._debounce_task.done():
+            self._debounce_task.cancel()
+        self._debounce_task = None
+        await super().async_will_remove_from_hass()
+
     def _build_ac_state(self) -> ACState:
         """Construct the logical ACState snapshot for the protocol encoder."""
         is_on = self._attr_hvac_mode != HVACMode.OFF
@@ -285,44 +316,86 @@ class MitsubishiHeavyClimate(ClimateEntity, RestoreEntity):
         return ACState(
             power=is_on,
             mode=proto_mode,
-            temperature=int(round(self._attr_target_temperature or DEFAULT_TEMP)),
+            temperature=int(round(self._target_temp)),
             fan=self._attr_fan_mode or FAN_AUTO,
             swing_v=self._attr_swing_mode or self._caps.default_swing_v,
             swing_h=self._attr_swing_horizontal_mode or self._caps.default_swing_h,
             preset=self._attr_preset_mode or PRESET_NONE,
         )
 
-    async def _async_transmit_state(self) -> None:
-        """Encode the current ACState and send it via Home Assistant's `remote` entity."""
-        remote_entity = self._configured_remote_entity or resolve_default_remote_entity(
-            self.hass
+    def _resolve_remote_or_raise(self) -> str:
+        """Resolve the target HA `remote` entity or raise HomeAssistantError immediately."""
+        remote_entity = self._configured_remote_entity or (
+            resolve_default_remote_entity(self.hass) if self.hass else None
         )
         if not remote_entity:
             raise HomeAssistantError(
                 "No IR `remote` entity found in Home Assistant. "
                 "Add a Broadlink/IR remote integration first."
             )
+        return remote_entity
 
-        ac_state = self._build_ac_state()
-        frame = encode_frame_bytes(self._protocol, ac_state)
-        command = encode_broadlink_command(self._protocol, ac_state)
-        self._last_frame_hex = frame.hex(" ")
+    async def _async_request_transmit(self) -> None:
+        """Transmit immediately if coalescing is disabled, or schedule a coalesced send."""
+        self._resolve_remote_or_raise()
+        if self._coalesce_delay <= 0:
+            await self._async_transmit_state()
+            return
 
-        _LOGGER.debug(
-            "Sending %s frame (%s) via %s",
-            self._protocol,
-            self._last_frame_hex,
-            remote_entity,
-        )
-        await self.hass.services.async_call(
-            REMOTE_DOMAIN,
-            SERVICE_SEND_COMMAND,
-            {
-                ATTR_ENTITY_ID: remote_entity,
-                ATTR_COMMAND: command,
-            },
-            blocking=True,
-        )
+        if self._debounce_task is not None and not self._debounce_task.done():
+            self._debounce_task.cancel()
+
+        coro = self._async_debounced_transmit(self._coalesce_delay)
+        if hasattr(self.hass, "async_create_background_task"):
+            self._debounce_task = self.hass.async_create_background_task(
+                coro,
+                f"{DOMAIN}_transmit_{getattr(self, 'entity_id', None) or self._attr_unique_id}",
+            )
+        else:
+            self._debounce_task = asyncio.create_task(coro)
+
+    async def _async_debounced_transmit(self, delay: float) -> None:
+        """Sleep through the coalesce window, then send one consolidated IR frame."""
+        try:
+            await asyncio.sleep(delay)
+            await self._async_transmit_state()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            _LOGGER.exception("Failed to transmit Mitsubishi Heavy IR frame")
+
+    async def _async_transmit_state(self) -> None:
+        """Encode the latest ACState and transmit it serialized via Home Assistant's `remote` entity."""
+        remote_entity = self._resolve_remote_or_raise()
+
+        async with self._tx_lock:
+            if self._min_tx_gap > 0 and self._last_tx_monotonic > 0:
+                elapsed = time.monotonic() - self._last_tx_monotonic
+                if elapsed < self._min_tx_gap:
+                    await asyncio.sleep(self._min_tx_gap - elapsed)
+
+            ac_state = self._build_ac_state()
+            frame = encode_frame_bytes(self._protocol, ac_state)
+            command = encode_broadlink_command(self._protocol, ac_state)
+            self._last_frame_hex = frame.hex(" ")
+
+            _LOGGER.debug(
+                "Sending %s frame (%s) via %s",
+                self._protocol,
+                self._last_frame_hex,
+                remote_entity,
+            )
+            await self.hass.services.async_call(
+                REMOTE_DOMAIN,
+                SERVICE_SEND_COMMAND,
+                {
+                    ATTR_ENTITY_ID: remote_entity,
+                    ATTR_COMMAND: command,
+                },
+                blocking=True,
+            )
+            self._last_tx_monotonic = time.monotonic()
+            self.async_write_ha_state()
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new target HVAC mode and transmit."""
@@ -333,8 +406,8 @@ class MitsubishiHeavyClimate(ClimateEntity, RestoreEntity):
         if hvac_mode != HVACMode.OFF:
             self._last_active_hvac_mode = hvac_mode
 
-        await self._async_transmit_state()
         self.async_write_ha_state()
+        await self._async_request_transmit()
 
     async def async_turn_on(self) -> None:
         """Turn the AC unit on using the last active HVAC mode."""
@@ -356,13 +429,13 @@ class MitsubishiHeavyClimate(ClimateEntity, RestoreEntity):
 
         temp = kwargs.get(ATTR_TEMPERATURE)
         if temp is not None:
-            self._attr_target_temperature = float(
-                max(MIN_TEMP, min(MAX_TEMP, int(round(float(temp)))))
+            self._set_target_temp(
+                float(max(MIN_TEMP, min(MAX_TEMP, int(round(float(temp))))))
             )
 
-        if self._attr_hvac_mode != HVACMode.OFF or hvac_mode == HVACMode.OFF:
-            await self._async_transmit_state()
         self.async_write_ha_state()
+        if self._attr_hvac_mode != HVACMode.OFF or hvac_mode == HVACMode.OFF:
+            await self._async_request_transmit()
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         """Set new target fan speed."""
@@ -375,9 +448,10 @@ class MitsubishiHeavyClimate(ClimateEntity, RestoreEntity):
         # On physical MHI remotes, manual fan speed cancels 3D Auto (which otherwise overrides air volume)
         if fan_mode != FAN_AUTO and self._attr_swing_horizontal_mode == SWING_H_3D_AUTO:
             self._attr_swing_horizontal_mode = self._caps.default_swing_h
-        if self._attr_hvac_mode != HVACMode.OFF:
-            await self._async_transmit_state()
+
         self.async_write_ha_state()
+        if self._attr_hvac_mode != HVACMode.OFF:
+            await self._async_request_transmit()
 
     async def async_set_swing_mode(self, swing_mode: str) -> None:
         """Set vertical louver swing mode."""
@@ -387,9 +461,10 @@ class MitsubishiHeavyClimate(ClimateEntity, RestoreEntity):
         # Manual vertical louver position cancels 3D Auto on physical MHI remotes
         if swing_mode != SWING_V_AUTO and self._attr_swing_horizontal_mode == SWING_H_3D_AUTO:
             self._attr_swing_horizontal_mode = self._caps.default_swing_h
-        if self._attr_hvac_mode != HVACMode.OFF:
-            await self._async_transmit_state()
+
         self.async_write_ha_state()
+        if self._attr_hvac_mode != HVACMode.OFF:
+            await self._async_request_transmit()
 
     async def async_set_swing_horizontal_mode(self, swing_horizontal_mode: str) -> None:
         """Set horizontal louver / 3D Auto mode."""
@@ -398,9 +473,10 @@ class MitsubishiHeavyClimate(ClimateEntity, RestoreEntity):
                 f"Unsupported horizontal swing mode: {swing_horizontal_mode}"
             )
         self._attr_swing_horizontal_mode = swing_horizontal_mode
-        if self._attr_hvac_mode != HVACMode.OFF:
-            await self._async_transmit_state()
+
         self.async_write_ha_state()
+        if self._attr_hvac_mode != HVACMode.OFF:
+            await self._async_request_transmit()
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         """Set preset mode (None, Boost/Hi-Power, Eco, Silent, Sleep)."""
@@ -413,6 +489,7 @@ class MitsubishiHeavyClimate(ClimateEntity, RestoreEntity):
             and self._attr_swing_horizontal_mode == SWING_H_3D_AUTO
         ):
             self._attr_swing_horizontal_mode = self._caps.default_swing_h
-        if self._attr_hvac_mode != HVACMode.OFF:
-            await self._async_transmit_state()
+
         self.async_write_ha_state()
+        if self._attr_hvac_mode != HVACMode.OFF:
+            await self._async_request_transmit()

@@ -25,6 +25,12 @@ MIN_TEMP = 18
 MAX_TEMP = 30
 TEMP_STEP = 1.0
 
+# Debounce window to coalesce multi-service bursts (e.g. Versatile Thermostat setting
+# mode + temperature + fan together) into a single complete MHI state IR packet, and
+# minimum gap between consecutive physical IR transmissions.
+COALESCE_DELAY_SECONDS = 0.25
+MIN_TX_GAP_SECONDS = 0.35
+
 # Known Home Assistant integrations that provide physical IR blaster `remote` entities
 IR_REMOTE_PLATFORMS: frozenset[str] = frozenset(
     {

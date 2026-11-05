@@ -92,11 +92,17 @@ def _install_ha_stubs() -> None:
             return getattr(self, "_attr_native_temperature_unit", None)
 
         @property
+        def native_target_temperature(self):
+            return getattr(self, "_attr_native_target_temperature", None)
+
+        @property
         def hvac_mode(self):
             return getattr(self, "_attr_hvac_mode", None)
 
         @property
         def target_temperature(self):
+            if hasattr(self, "_attr_native_target_temperature"):
+                return self._attr_native_target_temperature
             return getattr(self, "_attr_target_temperature", None)
 
         @property
@@ -123,6 +129,9 @@ def _install_ha_stubs() -> None:
             pass
 
         async def async_added_to_hass(self):
+            pass
+
+        async def async_will_remove_from_hass(self):
             pass
 
     ha_climate.HVACMode = HVACMode
@@ -386,8 +395,12 @@ class TestMitsubishiHeavyComponent(unittest.TestCase):
             name="Bedroom AC",
             unique_id="test_mhi_88",
             device_info=None,
+            coalesce_delay=0.0,
+            min_tx_gap=0.0,
         )
         entity.hass = hass
+        self.assertFalse(hasattr(entity, "_attr_target_temperature"))
+        self.assertEqual(entity.native_target_temperature, 23.0)
 
         # Changing temperature while OFF updates state without firing IR
         asyncio.run(entity.async_set_temperature(temperature=25))
@@ -445,11 +458,54 @@ class TestMitsubishiHeavyComponent(unittest.TestCase):
         asyncio.run(entity.async_turn_on())
         self.assertEqual(entity.hvac_mode, HVACMode.HEAT)
 
-        # Error when zero remotes exist
+        # Error when zero remotes exist (fails fast synchronously even when coalescing is active)
         entity_no_rem = MitsubishiHeavyClimate(PROTOCOL_MHI_88, None, "AC", "id2", None)
         entity_no_rem.hass = _FakeHass()
         with self.assertRaises(HomeAssistantError):
             asyncio.run(entity_no_rem.async_turn_on())
+
+    def test_burst_coalescing_for_versatile_thermostat(self) -> None:
+        hass = _FakeHass(reg_entries=[_MockRegEntry("remote.rm_mini", "remote", "broadlink")])
+        entity = MitsubishiHeavyClimate(
+            protocol=PROTOCOL_MHI_88,
+            remote_entity="remote.rm_mini",
+            name="Bedroom AC",
+            unique_id="test_coalesce",
+            device_info=None,
+            coalesce_delay=0.05,
+            min_tx_gap=0.0,
+        )
+        entity.hass = hass
+
+        async def _run_burst() -> None:
+            # Simulate Versatile Thermostat firing 4 sequential service calls back-to-back
+            await entity.async_set_hvac_mode(HVACMode.HEAT)
+            await entity.async_set_temperature(temperature=24)
+            await entity.async_set_fan_mode("high")
+            await entity.async_set_swing_mode("lowest")
+
+            # Attributes update immediately for VTherm, while 0 IR bursts have fired yet
+            self.assertEqual(entity.hvac_mode, HVACMode.HEAT)
+            self.assertEqual(entity.target_temperature, 24.0)
+            self.assertEqual(entity.fan_mode, "high")
+            self.assertEqual(entity.swing_mode, "lowest")
+            self.assertEqual(len(hass.sent_calls), 0)
+
+            # Wait past the 50ms coalesce window -> exactly ONE consolidated IR packet sent!
+            await asyncio.sleep(0.08)
+            self.assertEqual(len(hass.sent_calls), 1)
+            self.assertEqual(
+                entity.extra_state_attributes["last_ir_frame_hex"],
+                "ad 51 3c d9 26 02 fd 98 67 7c 83",
+            )
+
+            # Removal cancels any pending task without transmitting
+            await entity.async_set_temperature(temperature=26)
+            await entity.async_will_remove_from_hass()
+            await asyncio.sleep(0.08)
+            self.assertEqual(len(hass.sent_calls), 1)
+
+        asyncio.run(_run_burst())
 
     def test_entry_and_yaml_platform_setup_and_restore(self) -> None:
         hass = _FakeHass(reg_entries=[_MockRegEntry("remote.rm4", "remote", "broadlink")])
